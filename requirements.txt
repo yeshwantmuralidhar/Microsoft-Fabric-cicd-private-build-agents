@@ -1,0 +1,2 @@
+# No third-party packages. Deployment uses the Python 3.15 standard library.
+# No pip install is required for this REST-only implementation.

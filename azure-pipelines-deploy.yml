@@ -1,0 +1,131 @@
+trigger: none
+pr: none
+
+parameters:
+- name: deploy
+  displayName: Publish the Notebook to the test workspace
+  type: boolean
+  default: false
+
+variables:
+  POOL_NAME: 'REPLACE-WITH-POOL-NAME'
+  EXPECTED_AGENT_NAME: 'REPLACE-WITH-AGENT-NAME'
+  FABRIC_WORKSPACE_ID: 'REPLACE-WITH-TEST-WORKSPACE-ID'
+  EXPECTED_PRIVATE_IPS: 'REPLACE-WITH-PRIVATE-ENDPOINT-IPS'
+  PYTHON_EXE: 'REPLACE-WITH-PYTHON-EXE'
+
+pool:
+  name: $(POOL_NAME)
+  demands:
+  - Agent.Name -equals $(EXPECTED_AGENT_NAME)
+  - Agent.OS -equals Windows_NT
+
+stages:
+- stage: preflight
+  displayName: Preflight
+  jobs:
+  - job: verify
+    steps:
+    - checkout: self
+      clean: true
+      persistCredentials: false
+    - task: PowerShell@2
+      displayName: Verify agent identity, Python, DNS and TCP
+      inputs:
+        targetType: inline
+        workingDirectory: '$(Build.SourcesDirectory)'
+        script: |
+          $ErrorActionPreference = "Stop"
+          Write-Host "Agent: $env:AGENT_NAME"
+          Write-Host "Machine: $env:COMPUTERNAME"
+          Write-Host "Account: $([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)"
+          if ($env:AGENT_NAME -ne $env:EXPECTED_AGENT_NAME) {
+              throw "Unexpected agent."
+          }
+          if (-not (Test-Path -LiteralPath $env:PYTHON_EXE -PathType Leaf)) {
+              throw "Python not found at $env:PYTHON_EXE"
+          }
+          & $env:PYTHON_EXE -c "import sys; print(sys.executable); print(sys.version); sys.exit(0 if sys.version_info[:2] == (3, 15) else 'Python 3.15 is required')"
+          if ($LASTEXITCODE -ne 0) { throw "Python verification failed." }
+          $compact = ([guid]$env:FABRIC_WORKSPACE_ID).ToString("N")
+          $fabricHost = "$compact.z$($compact.Substring(0, 2)).w.api.fabric.microsoft.com"
+          $expected = @($env:EXPECTED_PRIVATE_IPS.Split(",") | ForEach-Object { $_.Trim() })
+          foreach ($address in $expected) {
+              $parsed = [System.Net.IPAddress]::Parse($address)
+              if ($parsed.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) {
+                  throw "Expected endpoint IPs must be IPv4."
+              }
+          }
+          $resolved = @(
+              Resolve-DnsName -Name $fabricHost -Type A -ErrorAction Stop |
+              Where-Object { $_.Type -eq "A" } |
+              Select-Object -ExpandProperty IPAddress -Unique
+          )
+          if ($resolved.Count -eq 0) { throw "No IPv4 DNS answers." }
+          foreach ($address in $resolved) {
+              if ($address -notin $expected) { throw "Unexpected DNS IP: $address" }
+          }
+          Write-Host "Fabric host: $fabricHost"
+          Write-Host "Resolved IPs: $($resolved -join ', ')"
+          $connection = Test-NetConnection -ComputerName $fabricHost -Port 443 -InformationLevel Detailed
+          Write-Host "Remote IP: $($connection.RemoteAddress)"
+          if (-not $connection.TcpTestSucceeded) { throw "TCP 443 failed." }
+          if ($connection.RemoteAddress.ToString() -notin $expected) {
+              throw "Unexpected TCP destination."
+          }
+          Write-Host "PASS: Private endpoint DNS and TCP checks."
+          & $env:PYTHON_EXE -B -m unittest -v test_deploy_fabric
+          if ($LASTEXITCODE -ne 0) { throw "Unit tests failed." }
+      env:
+        PYTHON_EXE: $(PYTHON_EXE)
+        EXPECTED_AGENT_NAME: $(EXPECTED_AGENT_NAME)
+        FABRIC_WORKSPACE_ID: $(FABRIC_WORKSPACE_ID)
+        EXPECTED_PRIVATE_IPS: $(EXPECTED_PRIVATE_IPS)
+
+- stage: read_only
+  displayName: Read-only Fabric API check
+  dependsOn: preflight
+  condition: succeeded()
+  jobs:
+  - job: check
+    steps:
+    - checkout: self
+      clean: true
+      persistCredentials: false
+    - task: PowerShell@2
+      displayName: Read workspace using VM managed identity
+      inputs:
+        targetType: inline
+        workingDirectory: '$(Build.SourcesDirectory)'
+        script: |
+          $ErrorActionPreference = "Stop"
+          & $env:PYTHON_EXE -B .\deploy_fabric.py --check
+          if ($LASTEXITCODE -ne 0) { throw "Read-only Fabric check failed." }
+      env:
+        PYTHON_EXE: $(PYTHON_EXE)
+        FABRIC_WORKSPACE_ID: $(FABRIC_WORKSPACE_ID)
+
+- stage: publish
+  displayName: Publish Notebook
+  dependsOn: read_only
+  condition: and(succeeded(), ${{ eq(parameters.deploy, true) }})
+  jobs:
+  - job: deploy_notebook
+    timeoutInMinutes: 40
+    steps:
+    - checkout: self
+      clean: true
+      persistCredentials: false
+    - task: PowerShell@2
+      displayName: Publish to the test workspace
+      inputs:
+        targetType: inline
+        workingDirectory: '$(Build.SourcesDirectory)'
+        script: |
+          $ErrorActionPreference = "Stop"
+          $env:FABRIC_REPOSITORY_DIRECTORY = Join-Path $env:BUILD_SOURCESDIRECTORY "workspace"
+          & $env:PYTHON_EXE -B .\deploy_fabric.py
+          if ($LASTEXITCODE -ne 0) { throw "Fabric deployment failed." }
+      env:
+        PYTHON_EXE: $(PYTHON_EXE)
+        FABRIC_WORKSPACE_ID: $(FABRIC_WORKSPACE_ID)
